@@ -123,7 +123,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>C:\Program Files\vJoy\SDK\inc;C:\Program Files\vJoy\SDK\lib\amd64;C:\Program Files\Force Dimension\sdk-3.17.6\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>vJoyInterface.lib;dhdms.lib;dhdms64.lib;drdms.lib;drdms64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dhdms.lib;dhdms64.lib;drdms.lib;drdms64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -142,11 +142,21 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>C:\Program Files\vJoy\SDK\inc;C:\Program Files\vJoy\SDK\lib\amd64;C:\Program Files\Force Dimension\sdk-3.17.6\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>vJoyInterface.lib;dhdms.lib;dhdms64.lib;drdms.lib;drdms64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dhdms.lib;dhdms64.lib;drdms.lib;drdms64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="FalconJoyForce.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="resource2.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="FalconJoyForce.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="..\..\..\Downloads\Falc1.ico" />
+    <Image Include="Falc1.png" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

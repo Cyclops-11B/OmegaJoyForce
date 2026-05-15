@@ -6,6 +6,7 @@
 #include <math.h>
 #include <dhdc.h>
 #include <string.h>
+#pragma comment(lib, "winmm.lib")
 
 // ── Serial port ────────────────────────────────────────────────────────────
 static const char* SERIAL_PORT = "\\\\.\\COM6";
@@ -16,18 +17,18 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int    UPDATE_RATE_MS = 1;
+static const int UPDATE_RATE_MS = 8;  // ~125Hz, within Falcon's range
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0001;
-static const double VEL_LOW_SENS = 20.0;  // sensitivity at low speeds
+static const double VEL_LOW_SENS = 17.0;  // sensitivity at low speeds
 static const double VEL_LOW_CURVE = 0.70; // curve for slow zone (lower = more boost)
 static const double VEL_HIGH_SENS = 55.0; // sensitivity at high speeds
 static const double VEL_HIGH_CURVE = 0.75; // curve for fast zone (1.0 = linear)
 static const double VEL_BLEND_LOW = 0.008; // below this = pure low speed
-static const double VEL_BLEND_HIGH = 0.25; // above this = pure high speed
+static const double VEL_BLEND_HIGH = 0.20; // above this = pure high speed
 static const double VEL_ALPHA = 0.8;  // 0.8 = very responsive, lower = smoother
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
@@ -45,7 +46,7 @@ static const double FRICTION_VEL_MAX = 0.004;   // velocity where feed forward f
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
-static const double FORCE_MAX_N = 7.5; // maximum allowable Force (in N)
+static const double FORCE_MAX_N = 9.0; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
@@ -54,23 +55,27 @@ static const double GRAVITY_COMP_SCALE = 2.3;  // 1.0 = normal, 1.2 = 20% more, 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
 static const double AMBIENT_LARGE_SCALE = 3.0;  // random rumble force scale
 static const double AMBIENT_SMALL_SCALE = 3.0;  // random rumble force scale
-static const double RUMBLE_DECAY = 0.25;
+static const double RUMBLE_DECAY = 0.55;
 static const double RUMBLE_FORCE_SCALE = 18.0; // overall scale factor of rumble force
 
 // ──Recoil settings ──────────────────────────────────────────────────────
 static const double RUMBLE_LARGE_SCALE = 6.0;  // recoil force scale
 static const double RUMBLE_SMALL_SCALE = 6.0;  // recoil force scale
 static const DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
+static const double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
 static const double RECOIL_CURVE = 0.60; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
+static const double RECOIL_DECAY_MIN = 0.25;  // decay for weak shots (fast cutoff)
+static const double RECOIL_DECAY_MAX = 0.75;  // decay for strong shots (long sustain)
+static const double RECOIL_MAG_SCALE = 20.0;  // liveMag value that maps to DECAY_MAX
 static const double RECOIL_AIM_DAMP = 0.4;  // stick sensitivity multiplier during recoil (0=frozen, 1=no effect)
 static const double RECOIL_DAMP_DECAY = 1.0;  // how fast aim damp fades per second
 static const double RECOIL_PUSH_SCALE = 20.0;  // sustained push force multiplier
-static const double RECOIL_DECAY = 0.15;
+
 static const double RECOIL_ATTACK_SEC = 0.0;
 static const DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot envelope
 
 static const DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
-static const double RECOIL_X_SCALE = 35.0;      // backwards kick strength
+static const double RECOIL_X_SCALE = 45.0;      // backwards kick strength
 static const double RECOIL_VERTICAL = 0.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
 static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
 static const double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
@@ -85,7 +90,7 @@ static const double RECOIL_YZ_SCALE = 0.25;   // Y/Z texture strength
 static double g_recoilQueue[RECOIL_QUEUE_SIZE] = {};
 static int    g_recoilQHead = 0;
 static int    g_recoilQTail = 0;
-static DWORD  g_lastRumbleTime = 0;
+static volatile DWORD g_lastRumbleTime = 0;
 static CRITICAL_SECTION g_recoilCS;
 
 static void RecoilEnqueue(double peak) {
@@ -128,6 +133,8 @@ static int    g_rapidShotCount = 0;    // consecutive shots that interrupted an 
 static double g_recoilYZDirY = 1.0;
 static double g_recoilYZDirZ = 0.0;
 static DWORD  g_lastYZDirChange = 0;
+static double g_recoilDecay = 0.55;  // current shot's decay rate
+static volatile bool g_running = true;
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -144,8 +151,8 @@ static bool SerialOpen(const char* port, DWORD baud) {
     SetCommState(g_hSerial, &dcb);
     COMMTIMEOUTS timeouts = {};
     timeouts.ReadIntervalTimeout = 1;
-    timeouts.ReadTotalTimeoutConstant = 2;
-    timeouts.WriteTotalTimeoutConstant = 10;
+    timeouts.ReadTotalTimeoutConstant = 1;
+    timeouts.WriteTotalTimeoutConstant = 1;
     SetCommTimeouts(g_hSerial, &timeouts);
     return true;
 }
@@ -165,7 +172,7 @@ static void SerialWrite(const BYTE* data, int len) {
 
 static DWORD WINAPI SerialReaderThread(LPVOID) {
     BYTE buf[4]; int pos = 0;
-    while (g_hSerial != INVALID_HANDLE_VALUE) {
+    while (g_running && g_hSerial != INVALID_HANDLE_VALUE) {
         BYTE b; DWORD n = 0;
         if (!ReadFile(g_hSerial, &b, 1, &n, NULL) || n == 0) { Sleep(1); continue; }
         if (pos == 0 && b != PACKET_OUT_MAGIC) continue;
@@ -268,7 +275,8 @@ struct AxisState {
         double bypassT = (velSpeed - 0.02) / (0.06 - 0.02);
         bypassT = bypassT < 0.0 ? 0.0 : (bypassT > 1.0 ? 1.0 : bypassT);
         double alpha = VEL_ALPHA + (1.0 - VEL_ALPHA) * bypassT;
-        smoothVel += alpha * (rawVel - smoothVel);
+        double alphaFinal = 1.0 - pow(1.0 - alpha, dt / 0.016);
+        smoothVel += alphaFinal * (rawVel - smoothVel);
 
         if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 1.5) {
             zeroCount++;
@@ -400,11 +408,21 @@ static void ApplyForces(double y, double z,
     dhdSetForce(rumX, forceY, forceZ);
 }
 
+int falconErrorCount = 0;
+static const int FALCON_MAX_ERRORS = 10;
+
 // ── Main ───────────────────────────────────────────────────────────────────
 int main() {
+    int comFreq = dhdGetComFreq();
+    printf("Falcon comm frequency: %d Hz\n", comFreq);
+    if (comFreq > 0 && comFreq < 100) {
+        printf("WARNING: Falcon comm rate low, consider increasing UPDATE_RATE_MS\n");
+    }
+    timeBeginPeriod(1);  // request 1ms timer resolution
     InitializeCriticalSection(&g_recoilCS);
 
     printf("FalconJoyForce - Falcon -> Pico 2W (Serial) -> Xbox Controller\n\n");
+    printf("Falcon scheduler rate: %d Hz\n", dhdGetComFreq());
 
     printf("Opening %s at %d baud...\n", SERIAL_PORT, SERIAL_BAUD);
     if (!SerialOpen(SERIAL_PORT, SERIAL_BAUD)) {
@@ -438,7 +456,11 @@ int main() {
     PushState2D push;
 
     double rumblePhase = 0.0;
-    DWORD  lastFrame = GetTickCount();
+    LARGE_INTEGER freq, frameStart, lastPerf;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&frameStart);
+    lastPerf = frameStart;
+
     DWORD  lastStats = GetTickCount();
     int    hz = 0;
     bool   debugMode = false;
@@ -446,13 +468,24 @@ int main() {
     g_btn1Released = GetTickCount();
 
     while (true) {
-        DWORD  now = GetTickCount();
-        double dt = (now - lastFrame) / 1000.0;
+        // ── High-resolution frame timing ──────────────────────────────
+        QueryPerformanceCounter(&frameStart);
+        DWORD now = GetTickCount();  // coarse ms for rumble/key timestamps
+        double dt = (double)(frameStart.QuadPart - lastPerf.QuadPart) / freq.QuadPart;
         if (dt > 0.05) dt = 0.01;
-        lastFrame = now;
+        lastPerf = frameStart;
 
         double x, y, z;
-        if (dhdGetPosition(&x, &y, &z) < 0) { printf("Lost Falcon\n"); break; }
+        if (dhdGetPosition(&x, &y, &z) < 0) {
+            falconErrorCount++;
+            if (falconErrorCount >= FALCON_MAX_ERRORS) {
+                printf("Lost Falcon after %d consecutive errors\n", FALCON_MAX_ERRORS);
+                break;
+            }
+            Sleep(1);
+            continue;  // skip this frame, try again next loop
+        }
+        falconErrorCount = 0;  // reset on successful read
 
         axY.UpdateVelocity(y, dt);
         axZ.UpdateVelocity(z, dt);
@@ -513,15 +546,15 @@ int main() {
             stickY = curve(axZ.smoothVel);
         }
 
-        rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
-        float rL = g_rumbleLarge, rS = g_rumbleSmall;
-
         // ── Button 1 recoil logic ──────────────────────────────────────────
         bool btn1held = (dhdGetButton(0) > 0);
         if (btn1WasHeld && !btn1held) g_btn1Released = now;
         btn1WasHeld = btn1held;
         static bool wasRecoilActive = false;
         bool recoilActive = btn1held || (now - g_btn1Released < RECOIL_WINDOW_MS);
+
+        rumblePhase += dt * 80.0 * 2.0 * 3.14159265;
+        float rL = g_rumbleLarge, rS = g_rumbleSmall;
 
         // Only trigger damp envelope on first press, not on each impulse
         if (recoilActive && !wasRecoilActive){
@@ -539,7 +572,11 @@ int main() {
 
         if (recoilActive) {
 
-            // ── Drain entire queue, keep highest peak ─────────────────────
+            // Live magnitude from rumble peaks — scales with signal strength
+            double liveMag = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE
+                + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
+
+            // ── Drain queue — shot detector only ──────────────────────────
             double queuePeak = 0.0;
             double nextPeak = 0.0;
             while (RecoilDequeue(nextPeak)) {
@@ -548,28 +585,51 @@ int main() {
 
             if (queuePeak > 0.0) {
                 if (!g_recoilFiring) {
-                    // Fresh shot — crisp X impulse only
-                    g_recoilPeak = queuePeak;
-                    g_recoilForce = queuePeak;
+                    g_recoilForce = liveMag;
+                    g_recoilPeak = liveMag;
                     g_recoilAttack = (RECOIL_ATTACK_SEC > 0.0) ? 0.0 : 1.0;
                     g_recoilFiring = true;
                     g_rapidShotCount = 0;
                     g_recoilYZForce = 0.0;
+
+                    // Scale decay with magnitude — bigger hit lasts longer
+                    double magT = liveMag / RECOIL_MAG_SCALE;
+                    magT = magT < 0.0 ? 0.0 : (magT > 1.0 ? 1.0 : magT);
+                    g_recoilDecay = RECOIL_DECAY_MIN + magT * (RECOIL_DECAY_MAX - RECOIL_DECAY_MIN);
                 }
                 else {
                     // Shot(s) arrived while firing — top up X and add Y/Z
                     g_rapidShotCount++;
-                    g_recoilForce = g_recoilForce + queuePeak * RECOIL_TOPUP_BLEND;
+                    if (liveMag > g_recoilForce) g_recoilForce = liveMag;
                     g_recoilPeak = g_recoilForce;
-                    g_recoilYZForce = queuePeak * RECOIL_YZ_SCALE;
+                    g_recoilYZForce = liveMag * RECOIL_YZ_SCALE;
+
+                    // Update decay to match current signal strength
+                    double magT = liveMag / RECOIL_MAG_SCALE;
+                    magT = magT < 0.0 ? 0.0 : (magT > 1.0 ? 1.0 : magT);
+                    g_recoilDecay = RECOIL_DECAY_MIN + magT * (RECOIL_DECAY_MAX - RECOIL_DECAY_MIN);
                 }
             }
 
-            // ── Decay Y/Z texture between shots ───────────────────────────
+            // ── Sustain refresh ────────────────────────────────────────────
+            bool sustainingRumble = (liveMag > RECOIL_SUSTAIN_THRESHOLD);
+            if (sustainingRumble) {
+                if (liveMag > g_recoilForce) {
+                    g_recoilForce = liveMag;
+                    g_recoilPeak = liveMag;
+                }
+                if (!g_recoilFiring && liveMag > 0.01) {
+                    g_recoilForce = liveMag;
+                    g_recoilPeak = liveMag;
+                    g_recoilFiring = true;
+                    g_recoilAttack = 1.0;
+                }
+            }
+
+            // ── Y/Z texture ────────────────────────────────────────────────
             double liveYZMag = 0.0;
-            if (g_rapidShotCount > 0) {
-                liveYZMag = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE
-                    + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE) * RECOIL_YZ_SCALE;
+            if (g_rapidShotCount > 0 || sustainingRumble) {
+                liveYZMag = liveMag * RECOIL_YZ_SCALE;
             }
             if (liveYZMag > g_recoilYZForce) g_recoilYZForce = liveYZMag;
             g_recoilYZForce *= (float)RUMBLE_DECAY;
@@ -596,11 +656,12 @@ int main() {
                 rumY = g_recoilYZDirY * g_recoilYZForce;
                 rumZ = g_recoilYZDirZ * g_recoilYZForce;
 
-                if (g_recoilAttack >= 1.0) {
-                    double frameDecay = pow(RECOIL_DECAY, dt * 1000.0);
+                // ← KEY: decay only runs when NOT being sustained
+                if (!sustainingRumble && g_recoilAttack >= 1.0) {
+                    double frameDecay = pow(g_recoilDecay, dt * 1000.0);
                     g_recoilForce *= frameDecay;
                     g_recoilPeak *= frameDecay;
-                    if (g_recoilForce < 0.05) {
+                    if (g_recoilForce < 0.01) {
                         g_recoilForce = 0.0;
                         g_recoilFiring = false;
                         g_rapidShotCount = 0;
@@ -616,18 +677,17 @@ int main() {
             }
             g_recoilYZForce = 0.0;
             g_rapidShotCount = 0;
-            rcPhase = 0.0;
             double tmp;
             while (RecoilDequeue(tmp)) {}
         }
 
         // Let in-flight impulse finish after button release
         if (!recoilActive && g_recoilFiring) {
-            double frameDecay = pow(RECOIL_DECAY, dt * 1000.0);
+            double frameDecay = pow(g_recoilDecay, dt * 1000.0);
             g_recoilForce *= frameDecay;
             g_recoilPeak *= frameDecay;
             rumX = g_recoilPeak * RECOIL_X_SCALE * 2.0;
-            if (g_recoilForce < 0.05) {
+            if (g_recoilForce < 0.01) {
                 g_recoilForce = 0.0;
                 g_recoilFiring = false;
             }
@@ -660,17 +720,16 @@ int main() {
 
         ApplyForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ);
 
-        // ── Button mask ────────────────────────────────────────────────────
+        // ── Button mask ── read early, send immediately ────────────────
         uint8_t btnMask = 0;
         for (int i = 0; i < 4; i++)
             if (dhdGetButton(i) > 0) btnMask |= (1u << i);
 
-        // ── Send controller packet ─────────────────────────────────────────
+        // Send with current stick values — stale by one frame but buttons are instant
         double stickScale = 1.0 - g_pushDamp;
         if (stickScale < 0.0) stickScale = 0.0;
         if (recoilActive)
             stickScale *= 1.0 - (1.0 - RECOIL_AIM_DAMP) * g_recoilDampEnv;
-
         int16_t lx = ToStick(stickX * stickScale * (INVERT_X ? -1.0 : 1.0));
         int16_t ly = ToStick(stickY * stickScale * (INVERT_Y ? -1.0 : 1.0));
         SendControllerPacket(lx, ly, btnMask);
@@ -726,10 +785,17 @@ int main() {
         Sleep(UPDATE_RATE_MS);
     }
 
+    // ── Shutdown ─────────────────────────────────────────────
+    g_running = false;           // signal reader thread to stop
+    Sleep(50);                   // give it time to exit cleanly
+
     dhdSetForce(0.0, 0.0, 0.0);
+    Sleep(10);                   // let force command complete
     dhdClose();
-    SerialClose();
+
+    SerialClose();               // close serial AFTER thread has stopped
     DeleteCriticalSection(&g_recoilCS);
+    timeEndPeriod(1);
     printf("\nDone.\n");
     return 0;
 }

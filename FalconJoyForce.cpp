@@ -17,7 +17,7 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int UPDATE_RATE_MS = 16;  // 8 = ~125Hz, within Falcon's range
+static const int UPDATE_RATE_MS = 15;  // 8 = ~125Hz, within Falcon's range
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
@@ -46,7 +46,7 @@ static const double FRICTION_VEL_MAX = 0.004;   // velocity where feed forward f
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
-static const double FORCE_MAX_N = 9; // maximum allowable Force (in N)
+static const double FORCE_MAX_N = 10; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
@@ -76,8 +76,8 @@ static const DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot env
 
 static const DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
 static const double RECOIL_X_SCALE = 10.0;      // backwards kick strength
-static const double RECOIL_VERTICAL = 0.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
-static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
+static const double RECOIL_VERTICAL = 1.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
+//static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
 static const double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
 
 static const double RECOIL_TOPUP_BLEND = 0.6;   // how much of new peak boosts current force
@@ -87,10 +87,9 @@ static const double RECOIL_YZ_SCALE = 0.25;   // Y/Z texture strength
 
 // ── Recoil impulse queue ───────────────────────────────────────────────────
 #define RECOIL_QUEUE_SIZE 64
-static double g_recoilQueue[RECOIL_QUEUE_SIZE] = {};
-static int    g_recoilQHead = 0;
-static int    g_recoilQTail = 0;
-static volatile DWORD g_lastRumbleTime = 0;
+static volatile double g_recoilQueue[RECOIL_QUEUE_SIZE] = {};
+static volatile int    g_recoilQHead = 0;
+static volatile int    g_recoilQTail = 0;
 static CRITICAL_SECTION g_recoilCS;
 
 static void RecoilEnqueue(double peak) {
@@ -137,7 +136,7 @@ static double g_recoilDecay = 0.55;  // current shot's decay rate
 static volatile bool g_running = true;
 static volatile uint8_t g_btnMask = 0;
 static volatile uint8_t g_dhdButtons = 0;
-
+static volatile DWORD g_lastRumbleTime = 0;
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -185,16 +184,19 @@ static DWORD WINAPI SerialReaderThread(LPVOID) {
             if ((buf[1] ^ buf[2]) == buf[3]) {
                 float inL = buf[1] / 255.0f;
                 float inS = buf[2] / 255.0f;
+
+                // Compute rawMag before using it
+                double rawMag = (inL * 1.0 + inS * 0.5);
+
+                // Lock rumble state
+                EnterCriticalSection(&g_recoilCS);
                 if (inL > g_rumbleLarge) g_rumbleLarge = inL;
                 if (inS > g_rumbleSmall) g_rumbleSmall = inS;
-                g_rumbleLargePeak = inL;   // ← raw peak, no decay
+                g_rumbleLargePeak = inL;
                 g_rumbleSmallPeak = inS;
-                double rawMag = (inL * 1.0 + inS * 0.5);
-                static DWORD lastRawPrint = 0;
-                if (GetTickCount() - lastRawPrint > 100) {
-                    lastRawPrint = GetTickCount();
-                    printf("\nRAW: L=%.3f S=%.3f mag=%.3f\n", inL, inS, rawMag);
-                }
+                LeaveCriticalSection(&g_recoilCS);
+
+                // Enqueue outside the lock
                 double newRecoil = pow(rawMag, RECOIL_CURVE) * RUMBLE_FORCE_SCALE * FORCE_MAX_N;
                 RecoilEnqueue(newRecoil);
                 g_lastRumbleTime = GetTickCount();
@@ -420,7 +422,9 @@ static DWORD WINAPI HapticThread(LPVOID) {
             Sleep(1);
             continue;  // just skip this frame, don't try to reconnect
         }
+        EnterCriticalSection(&g_forceCS);
         g_posX = px; g_posY = py; g_posZ = pz;
+        LeaveCriticalSection(&g_forceCS);
 
         uint8_t btns = 0;
         for (int i = 0; i < 4; i++)
@@ -472,6 +476,8 @@ int main() {
         SerialClose(); getchar(); return -1;
     }
 
+   // timeBeginPeriod(1);
+
     // Now safe to query — device is open
     double comFreq = dhdGetComFreq();
     printf("Falcon comm frequency: %.1f Hz\n", comFreq);
@@ -481,7 +487,7 @@ int main() {
     dhdSetGravityCompensation(DHD_ON);
     dhdSetStandardGravity(9.81 * GRAVITY_COMP_SCALE);
     dhdSetTimeGuard(0);   // disable SDK throttling
-    dhdSetWatchdog(20);   // 20ms watchdog
+    dhdSetWatchdog(200);   // 200ms watchdog
 
     printf("Falcon ready. SDK %s\n\n", dhdGetSDKVersionStr());
     printf("Serial: %s   Push zone: %.0f%%   Force max rad: %.2f\n",
@@ -515,7 +521,21 @@ int main() {
         lastFrame = now;
 
         // Read position and buttons from haptic thread cache
-        double x = g_posX, y = g_posY, z = g_posZ;
+        double x, y, z;
+        EnterCriticalSection(&g_forceCS);
+        x = g_posX; y = g_posY; z = g_posZ;
+        LeaveCriticalSection(&g_forceCS);
+
+        float rL, rS, rLP, rSP;
+        // snapshot all rumble state atomically
+        EnterCriticalSection(&g_recoilCS);
+        rL = g_rumbleLarge;
+        rS = g_rumbleSmall;
+        rLP = g_rumbleLargePeak;
+        rSP = g_rumbleSmallPeak;
+        g_rumbleLarge *= (float)RUMBLE_DECAY;
+        g_rumbleSmall *= (float)RUMBLE_DECAY;
+        LeaveCriticalSection(&g_recoilCS);
 
         axY.UpdateVelocity(y, dt);
         axZ.UpdateVelocity(z, dt);
@@ -577,8 +597,6 @@ int main() {
         btn1WasHeld = btn1held;
         recoilActive = btn1held || (now - g_btn1Released < RECOIL_WINDOW_MS);
 
-        float rL = g_rumbleLarge, rS = g_rumbleSmall;
-
         if (recoilActive && !wasRecoilActive)
             g_recoilDampEnv = 1.0;
         wasRecoilActive = recoilActive;
@@ -590,7 +608,7 @@ int main() {
         static double rcPhase = 0.0;
 
         if (recoilActive) {
-            double liveMag = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE
+            double liveMag = (rLP * RUMBLE_LARGE_SCALE
                 + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
 
             double queuePeak = 0.0, nextPeak = 0.0;
@@ -715,9 +733,6 @@ int main() {
             }
         }
 
-        g_rumbleLarge = rL * (float)RUMBLE_DECAY;
-        g_rumbleSmall = rS * (float)RUMBLE_DECAY;
-
         ComputeAndStoreForces(y, z, axY, axZ, axY.smoothVel, axZ.smoothVel, rumX, rumY, rumZ);
 
         // ── Status display ─────────────────────────────────────────
@@ -776,7 +791,7 @@ int main() {
         int16_t ly = ToStick(stickY * stickScale * (INVERT_Y ? -1.0 : 1.0));
         SendControllerPacket(lx, ly, g_btnMask);
 
-        Sleep(1);
+        Sleep(UPDATE_RATE_MS);
     }
 
     // ── Shutdown ─────────────────────────────────────────────

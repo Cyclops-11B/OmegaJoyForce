@@ -25,13 +25,17 @@ static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0001;
-static const double VEL_LOW_SENS = 17.0;  // sensitivity at low speeds
-static const double VEL_LOW_CURVE = 0.70; // curve for slow zone (lower = more boost)
+static const double VEL_LOW_SENS = 15.0;  // sensitivity at low speeds
+static const double VEL_LOW_CURVE = 0.92; // curve for slow zone (lower = more boost)
 static const double VEL_HIGH_SENS = 55.0; // sensitivity at high speeds
 static const double VEL_HIGH_CURVE = 0.75; // curve for fast zone (1.0 = linear)
-static const double VEL_BLEND_LOW = 0.008; // below this = pure low speed
+static const double VEL_BLEND_LOW = 0.018; // below this = pure low speed
 static const double VEL_BLEND_HIGH = 0.20; // above this = pure high speed
-static const double VEL_ALPHA = 0.6;  // 0.8 = very responsive, lower = smoother
+static const double VEL_ALPHA_LOW = 0.55;  // 0.8 = very responsive, lower = smoother
+static const double VEL_ALPHA_MID = 0.6;  // 0.8 = very responsive, lower = smoother
+static const double VEL_ALPHA_HIGH = 0.7;  // 0.8 = very responsive, lower = smoother
+static const double SOFT_RAMP = 0.002;  // m/s width of ramp zone
+static const double SHORT_VEL_NOISE = 0.0006;  // raised: was 0.005, suppresses more low-speed noise
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -42,9 +46,9 @@ static const double HALF_RANGE_MAX = 0.06; // how large work radius is (in m)
 static const double PUSH_DAMP_COEFF = 0.9; // damping strength on direction reversal (0=none, 1=strong)
 static const double PUSH_DAMP_DECAY = 3.0; // how quickly damping fades (higher = faster)
 
-static const double FRICTION_CANCEL = 0.4;    // feed forward force in Newtons
+static const double FRICTION_CANCEL = .2;    // feed forward force in Newtons
 static const double FRICTION_VEL_MIN = 0.0002;  // velocity where feed forward starts fading in
-static const double FRICTION_VEL_MAX = 0.004;   // velocity where feed forward finishes fading out
+static const double FRICTION_VEL_MAX = 0.02;   // velocity where feed forward finishes fading out
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
@@ -55,17 +59,17 @@ static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = 
 static const double GRAVITY_COMP_SCALE = 2.3;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
-static const double AMBIENT_LARGE_SCALE = 6.0;  // random rumble force scale
-static const double AMBIENT_SMALL_SCALE = 6.0;  // random rumble force scale
+static const double AMBIENT_LARGE_SCALE = 2.8;  // random rumble force scale
+static const double AMBIENT_SMALL_SCALE = 2.8;  // random rumble force scale
 static const double RUMBLE_DECAY = 0.60;
 static const double RUMBLE_FORCE_SCALE = 30.0; // overall scale factor of rumble force
 
 // ──Recoil settings ──────────────────────────────────────────────────────
-static const double RUMBLE_LARGE_SCALE = 3.0;  // recoil force scale
-static const double RUMBLE_SMALL_SCALE = 3.0;  // recoil force scale
+static const double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
+static const double RUMBLE_SMALL_SCALE = 2.4;  // recoil force scale
 static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
-static const double RECOIL_CURVE = 0.60; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
+static const double RECOIL_CURVE = 0.50; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
 static const double RECOIL_DECAY = 0.45;
 static const double RECOIL_DECAY_MIN = 0.25;  // decay for weak shots (fast cutoff)
 static const double RECOIL_DECAY_MAX = 0.75;  // decay for strong shots (long sustain)
@@ -233,9 +237,9 @@ struct AxisState {
     int zeroCount = 0;
 
     // Ring buffer
-    static const int VEL_WINDOW = 4;
-    double posHistory[6] = {};
-    double timeHistory[6] = {};
+    static const int VEL_WINDOW = 6;
+    double posHistory[8] = {};
+    double timeHistory[8] = {};
     int    posIdx = 0;
     bool   posSeeded = false;
 
@@ -270,23 +274,33 @@ struct AxisState {
             + timeHistory[(posIdx + VEL_WINDOW - 2) % VEL_WINDOW];
         double shortVel = (t2 > 0.0001) ? (pos - posHistory[prev2]) / t2 : 0.0;
 
-        // Only use short vel if it's meaningfully larger AND above noise floor
-        static const double SHORT_VEL_NOISE = 0.005;  // ignore short vel below this
+        // Only use shortVel if it's larger AND above noise floor
         if (fabs(shortVel) > SHORT_VEL_NOISE && fabs(shortVel) > fabs(avgVel))
             rawVel = shortVel;
         else
             rawVel = avgVel;
 
-        // Full bypass at high speed, full smoothing at low speed
         double velSpeed = fabs(rawVel);
-        double bypassT = (velSpeed - 0.02) / (0.06 - 0.02);
-        bypassT = bypassT < 0.0 ? 0.0 : (bypassT > 1.0 ? 1.0 : bypassT);
-        double alpha = VEL_ALPHA + (1.0 - VEL_ALPHA) * bypassT;
+        double alpha;
+        if (velSpeed < VEL_BLEND_LOW) {
+            alpha = VEL_ALPHA_LOW;                                      // heavy smoothing
+        }
+        else if (velSpeed < VEL_BLEND_HIGH) {
+            double t = (velSpeed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
+            t = t * t * (3.0 - 2.0 * t);                               // smoothstep the blend too
+            alpha = VEL_ALPHA_LOW + (VEL_ALPHA_MID - VEL_ALPHA_LOW) * t;  // FIX: actually use t
+        }
+        else {
+            double bypassT = (velSpeed - VEL_BLEND_HIGH) / (HALF_RANGE_MAX - VEL_BLEND_HIGH);
+            bypassT = bypassT < 0.0 ? 0.0 : (bypassT > 1.0 ? 1.0 : bypassT);
+            alpha = VEL_ALPHA_MID + (VEL_ALPHA_HIGH - VEL_ALPHA_MID) * bypassT;  // FIX: blend up from mid
+        }
         smoothVel += alpha * (rawVel - smoothVel);
 
-        if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 1.5) {
+        // Restore zero-snap: without this, smoothVel drifts around a tiny nonzero value near rest
+        if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 2.0) {
             zeroCount++;
-            if (zeroCount > 8) smoothVel = 0.0;
+            if (zeroCount > 10) smoothVel = 0.0;
         }
         else {
             zeroCount = 0;
@@ -514,19 +528,20 @@ int main() {
                 double sign = v > 0.0 ? 1.0 : -1.0;
                 double speed = fabs(v);
 
-                // Low zone — power curve, capped at 1.0
-                double lo = evalZone(v, VEL_LOW_SENS, VEL_LOW_CURVE);
+                // Soft ramp: smoothly scale from 0 at deadzone edge to full output
+                double ramp = (speed - VEL_DEADZONE) / SOFT_RAMP;
+                ramp = ramp < 0.0 ? 0.0 : (ramp > 1.0 ? 1.0 : ramp);
+                ramp = ramp * ramp * (3.0 - 2.0 * ramp);  // smoothstep
 
-                // High zone — linear, uncapped so fast flicks get full output
+                double lo = evalZone(v, VEL_LOW_SENS, VEL_LOW_CURVE);
                 double hi = speed * VEL_HIGH_SENS;
                 if (hi > 1.0) hi = 1.0;
 
-                // Blend
                 double t = (speed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
                 t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
                 t = t * t * (3.0 - 2.0 * t);
 
-                return sign * (lo * (1.0 - t) + hi * t);
+                return sign * (lo * (1.0 - t) + hi * t) * ramp;  // ← multiply by ramp
             };
 
             stickX = curve(axY.smoothVel);

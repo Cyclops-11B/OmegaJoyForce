@@ -19,23 +19,26 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int UPDATE_RATE_MS = 5;  // 8 = ~125Hz, within Falcon's range
+static const int UPDATE_RATE_MS = 3;  // 8 = ~125Hz, within Falcon's range
 static const bool   INVERT_X = false;
 static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0001;
+static const double VEL_VLOW_SENS = 8.0;    // sensitivity for very slow corrections
+static const double VEL_VLOW_CURVE = 0.95;   // closer to 1.0 = more linear, less boosted
 static const double VEL_LOW_SENS = 15.0;  // sensitivity at low speeds
 static const double VEL_LOW_CURVE = 0.92; // curve for slow zone (lower = more boost)
 static const double VEL_HIGH_SENS = 55.0; // sensitivity at high speeds
 static const double VEL_HIGH_CURVE = 0.75; // curve for fast zone (1.0 = linear)
-static const double VEL_BLEND_LOW = 0.018; // below this = pure low speed
-static const double VEL_BLEND_HIGH = 0.20; // above this = pure high speed
-static const double VEL_ALPHA_LOW = 0.55;  // 0.8 = very responsive, lower = smoother
+static const double VEL_BLEND_VLOW = 0.004;  // below this = pure vlow zone
+static const double VEL_BLEND_LOW = 0.018; // below this = low speed
+static const double VEL_BLEND_HIGH = 0.20; // above this = high speed
+static const double VEL_ALPHA_LOW = 0.5;  // 0.8 = very responsive, lower = smoother
 static const double VEL_ALPHA_MID = 0.6;  // 0.8 = very responsive, lower = smoother
 static const double VEL_ALPHA_HIGH = 0.7;  // 0.8 = very responsive, lower = smoother
 static const double SOFT_RAMP = 0.002;  // m/s width of ramp zone
-static const double SHORT_VEL_NOISE = 0.0006;  // raised: was 0.005, suppresses more low-speed noise
+static const double SHORT_VEL_NOISE = 0.0006;  // was 0.005, higher suppresses more low-speed noise
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -52,7 +55,7 @@ static const double FRICTION_VEL_MAX = 0.02;   // velocity where feed forward fi
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
-static const double FORCE_MAX_N = 9; // maximum allowable Force (in N)
+static const double FORCE_MAX_N = 5; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
@@ -516,6 +519,21 @@ int main() {
         if (g_pushDamp < 0.0) g_pushDamp = 0.0;
         if (g_pushDamp > 1.0) g_pushDamp = 1.0;
 
+        // ── Recoil velocity bleed ──────────────────────────────────────────────
+        // Prevents physical Falcon settling during recoil tail from reaching stick output
+        if (g_recoilFiring) {
+            double bleedStrength = (g_recoilForce / RECOIL_MAG_SCALE);
+            bleedStrength = bleedStrength < 0.0 ? 0.0 : (bleedStrength > 1.0 ? 1.0 : bleedStrength);
+            // Bias: specifically gate downward (negative Z) velocity harder than upward
+            // since gravity is the primary cause of the tail drift
+            double bleedY = 1.0 - bleedStrength * 0.5;
+            double bleedZ = (axZ.smoothVel < 0.0)
+                ? 1.0 - bleedStrength * 0.8   // stronger bleed on downward motion
+                : 1.0 - bleedStrength * 0.4;  // lighter on upward
+            axY.smoothVel *= bleedY;
+            axZ.smoothVel *= bleedZ;
+        }
+
         if (!inPush) {
             auto evalZone = [](double v, double sens, double crv) -> double {
                 double scaled = fabs(v) * sens;
@@ -528,20 +546,27 @@ int main() {
                 double sign = v > 0.0 ? 1.0 : -1.0;
                 double speed = fabs(v);
 
-                // Soft ramp: smoothly scale from 0 at deadzone edge to full output
                 double ramp = (speed - VEL_DEADZONE) / SOFT_RAMP;
                 ramp = ramp < 0.0 ? 0.0 : (ramp > 1.0 ? 1.0 : ramp);
-                ramp = ramp * ramp * (3.0 - 2.0 * ramp);  // smoothstep
+                ramp = ramp * ramp * (3.0 - 2.0 * ramp);
 
+                double vlow = evalZone(v, VEL_VLOW_SENS, VEL_VLOW_CURVE);
                 double lo = evalZone(v, VEL_LOW_SENS, VEL_LOW_CURVE);
                 double hi = speed * VEL_HIGH_SENS;
                 if (hi > 1.0) hi = 1.0;
 
-                double t = (speed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
-                t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
-                t = t * t * (3.0 - 2.0 * t);
+                // Blend vlow -> lo
+                double tVlow = (speed - VEL_BLEND_VLOW) / (VEL_BLEND_LOW - VEL_BLEND_VLOW);
+                tVlow = tVlow < 0.0 ? 0.0 : (tVlow > 1.0 ? 1.0 : tVlow);
+                tVlow = tVlow * tVlow * (3.0 - 2.0 * tVlow);
+                double lowBlended = vlow + (lo - vlow) * tVlow;
 
-                return sign * (lo * (1.0 - t) + hi * t) * ramp;  // ← multiply by ramp
+                // Blend lowBlended -> hi
+                double tHi = (speed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
+                tHi = tHi < 0.0 ? 0.0 : (tHi > 1.0 ? 1.0 : tHi);
+                tHi = tHi * tHi * (3.0 - 2.0 * tHi);
+
+                return sign * (lowBlended * (1.0 - tHi) + hi * tHi) * ramp;
             };
 
             stickX = curve(axY.smoothVel);

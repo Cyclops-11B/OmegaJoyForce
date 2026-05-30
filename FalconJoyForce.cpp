@@ -150,6 +150,7 @@ static volatile uint8_t g_btnMask = 0;
 static volatile uint8_t g_dhdButtons = 0;
 //static volatile DWORD  g_lastRumbleTime = 0;
 
+
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
 

@@ -69,7 +69,7 @@ static const double RUMBLE_FORCE_SCALE = 30.0; // overall scale factor of rumble
 // ──Recoil settings ──────────────────────────────────────────────────────
 static const double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
 static const double RUMBLE_SMALL_SCALE = 2.4;  // recoil force scale
-static const DWORD  RECOIL_WINDOW_MS = 150; // ms after btn 1 release to still catch trigger recoil
+static const DWORD  RECOIL_WINDOW_MS = 250; // ms after btn 1 release to still catch trigger recoil
 static const double RECOIL_SUSTAIN_THRESHOLD = 0.5;  // liveMag above this = sustaining
 static const double RECOIL_CURVE = 0.50; // Recoil compressor -  0.3 boosts small recoils; 1.0 = linear
 static const double RECOIL_DECAY = 0.45;
@@ -292,6 +292,7 @@ struct AxisState {
         else
             rawVel = avgVel;
 
+        //Alpha section - smoothing at each speed bracket
         double velSpeed = fabs(rawVel);
         double fc;
         if (velSpeed < VEL_BLEND_VLOW) {
@@ -404,17 +405,26 @@ static void ApplyForces(double y, double z,
     double r = sqrt(offY * offY + offZ * offZ);
     double forceY = 0.0, forceZ = 0.0;
 
+    //Spring force bounding box
     if (r > FORCE_SPRING_START) {
         double dirY = offY / r, dirZ = offZ / r;
         double t = (r - FORCE_SPRING_START) / (FORCE_MAX_RAD - FORCE_SPRING_START);
         t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
         double mag = pow(t, FORCE_EXPONENT) * FORCE_MAX_N;
-        double vOut = velY * dirY + velZ * dirZ; // velocity component outward
+        double vOut = velY * dirY + velZ * dirZ; // outward velocity component
         if (vOut > 0.0) {
-            // Scale damping up with proximity to PUSH_ENTER_RAD
             double proximity = (r - FORCE_SPRING_START) / (PUSH_ENTER_RAD - FORCE_SPRING_START);
             proximity = proximity < 0.0 ? 0.0 : (proximity > 1.0 ? 1.0 : proximity);
-            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 4.0); // up to 5x at edge
+
+            // Gate: only apply enhanced damping above a velocity threshold
+            static const double DAMP_VEL_MIN = 0.004; // below this = no enhanced damping
+            static const double DAMP_VEL_MAX = 0.020; // above this = full enhanced damping
+            double velMag = sqrt(velY * velY + velZ * velZ);
+            double velGate = (velMag - DAMP_VEL_MIN) / (DAMP_VEL_MAX - DAMP_VEL_MIN);
+            velGate = velGate < 0.0 ? 0.0 : (velGate > 1.0 ? 1.0 : velGate);
+            velGate = velGate * velGate * (3.0 - 2.0 * velGate); // smoothstep
+
+            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 4.0 * velGate);
             mag += vOut * dynamicDamp;
         }
         forceY = -dirY * mag;
@@ -424,7 +434,7 @@ static void ApplyForces(double y, double z,
     forceY += rumY;
     forceZ += rumZ;
 
-    // Friction cancellation unchanged
+    // Friction cancellation
     static const double FRICTION_VEL_MIN = 0.003;
     static const double FRICTION_VEL_MAX = 0.08;
     double velMag = sqrt(velY * velY + velZ * velZ);
@@ -436,7 +446,7 @@ static void ApplyForces(double y, double z,
         forceZ += (velZ / velMag) * FRICTION_CANCEL * blend;
     }
 
-    // Cap X and YZ independently — they are physically separate axes
+    // Cap X and YZ independently
     // X = recoil/rumble push, YZ = spring + lateral rumble
     double yzMag = sqrt(forceY * forceY + forceZ * forceZ);
     if (yzMag > 7.8) {

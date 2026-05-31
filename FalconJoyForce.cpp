@@ -25,20 +25,19 @@ static const bool   INVERT_Y = false;
 
 // ──Velocity settings ──────────────────────────────────────────────────────
 static const double VEL_DEADZONE = 0.0001;
-static const double VEL_VLOW_SENS = 8.0;    // sensitivity for very slow corrections
-static const double VEL_VLOW_CURVE = 0.95;   // closer to 1.0 = more linear, less boosted
-static const double VEL_LOW_SENS = 15.0;  // sensitivity at low speeds
-static const double VEL_LOW_CURVE = 0.92; // curve for slow zone (lower = more boost)
-static const double VEL_HIGH_SENS = 55.0; // sensitivity at high speeds
-static const double VEL_HIGH_CURVE = 0.75; // curve for fast zone (1.0 = linear)
+static const double VEL_VLOW_SENS = 22.0;    // sensitivity for very slow corrections
+static const double VEL_VLOW_CURVE = 0.80;   // closer to 1.0 = more linear, less boosted
+static const double VEL_LOW_SENS = 18.0;  // sensitivity at low speeds
+static const double VEL_LOW_CURVE = 0.88; // curve for slow zone (lower = more boost)
+static const double VEL_HIGH_SENS = 12.0; // sensitivity at high speeds
+static const double VEL_HIGH_CURVE = 0.95; // curve for fast zone (1.0 = linear)
 static const double VEL_BLEND_VLOW = 0.004;  // below this = pure vlow zone
-static const double VEL_BLEND_LOW = 0.018; // below this = low speed
-static const double VEL_BLEND_HIGH = 0.20; // above this = high speed
-static const double VEL_ALPHA_LOW = 0.5;  // 0.8 = very responsive, lower = smoother
-static const double VEL_ALPHA_MID = 0.6;  // 0.8 = very responsive, lower = smoother
-static const double VEL_ALPHA_HIGH = 0.7;  // 0.8 = very responsive, lower = smoother
-static const double SOFT_RAMP = 0.002;  // m/s width of ramp zone
-static const double SHORT_VEL_NOISE = 0.0006;  // was 0.005, higher suppresses more low-speed noise
+static const double VEL_BLEND_LOW = 0.025; // below this = low speed
+static const double VEL_BLEND_HIGH = 0.15; // above this = high speed
+static const double SOFT_RAMP = 0.004;  // m/s width of ramp zone
+static const double SHORT_VEL_NOISE = 0.0005;  // higher suppresses more low-speed noise
+static const double VEL_VLOW_POS_SCALE = 7.0;  // position error scale
+double posBlendMax = VEL_BLEND_LOW * 2.0;
 
 static const double PUSH_ENTER_RAD = 0.56; // percentage of work radius where push zone kicks in
 static const double PUSH_EXIT_RAD = 0.56; // percentage of work radius where push zone stops acting
@@ -55,15 +54,15 @@ static const double FRICTION_VEL_MAX = 0.02;   // velocity where feed forward fi
 
 static const double FORCE_SPRING_START = 0.3; // percentage of work radius where spring force starts
 static const double FORCE_MAX_RAD = 0.88; // percentage of work radius where max force is achieved
-static const double FORCE_MAX_N = 5; // maximum allowable Force (in N)
+static const double FORCE_MAX_N = 8; // maximum allowable Force (in N)
 static const double FORCE_DAMPING = 3.0; // cut down on springiness
 static const double FORCE_EXPONENT = 2.3; // how you ramp to max force. lower = force builds earlier and harder
 
 static const double GRAVITY_COMP_SCALE = 2.3;  // 1.0 = normal, 1.2 = 20% more, 0.8 = 20% less
 
 // ──Ambient Rumble settings ──────────────────────────────────────────────────────
-static const double AMBIENT_LARGE_SCALE = 2.8;  // random rumble force scale
-static const double AMBIENT_SMALL_SCALE = 2.8;  // random rumble force scale
+static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
+static const double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
 static const double RUMBLE_DECAY = 0.60;
 static const double RUMBLE_FORCE_SCALE = 30.0; // overall scale factor of rumble force
 
@@ -85,8 +84,8 @@ static const double RECOIL_ATTACK_SEC = 0.0;
 static const DWORD MIN_EDGE_INTERVAL_MS = 35;   // longer than a single-shot envelope
 
 static const DWORD  RECOIL_DIR_CHANGE_MS = 40;  // how often direction randomizes (same as ambient)
-static const double RECOIL_X_SCALE = 10.0;      // backwards kick strength
-static const double RECOIL_VERTICAL = 0.5;  // upward force as fraction of recoil (0=none, 1=equal to X)
+static const double RECOIL_X_SCALE = 20.0;      // backwards kick strength
+static const double RECOIL_VERTICAL = 10.0;  // upward force as fraction of recoil (0=none, 1=equal to X)
 //static const double RECOIL_Z_RETURN_RATE = 0.2;  // how fast debt bleeds back (higher = snappier return)
 static const double EDGE_THRESHOLD = 2.0;  //how much of a rising edge is considered a new impulse
 
@@ -149,7 +148,6 @@ static volatile bool   g_running = true;
 static volatile uint8_t g_btnMask = 0;
 static volatile uint8_t g_dhdButtons = 0;
 //static volatile DWORD  g_lastRumbleTime = 0;
-
 
 // ── Serial ─────────────────────────────────────────────────────────────────
 static HANDLE g_hSerial = INVALID_HANDLE_VALUE;
@@ -238,9 +236,10 @@ struct AxisState {
     double lastPos = 0.0;
     double smoothVel = 0.0;
     double rawVel = 0.0;
-    int zeroCount = 0;
+    int    zeroCount = 0;
+    double slowRef = 0.0;
+    bool   slowRefSeeded = false;
 
-    // Ring buffer
     static const int VEL_WINDOW = 6;
     double posHistory[8] = {};
     double timeHistory[8] = {};
@@ -251,6 +250,18 @@ struct AxisState {
         if (pos < absMin) absMin = pos;
         if (pos > absMax) absMax = pos;
         if (absMax > absMin) { seeded = true; estCenter = (absMin + absMax) / 2.0; }
+    }
+
+    void UpdateSlowRef(double pos, double dt) {
+        if (!slowRefSeeded) { slowRef = pos; slowRefSeeded = true; return; }
+        double alpha = 1.0 - exp(-2.0 * 3.14159265 * 1.2 * dt);  // was 2.0Hz, now 1.2Hz
+        slowRef += alpha * (pos - slowRef);
+    }
+
+    double PosError(double pos) const {
+        if (halfRange < 0.001) return 0.0;
+        double e = (pos - slowRef) / halfRange;
+        return e < -1.0 ? -1.0 : (e > 1.0 ? 1.0 : e);
     }
 
     void UpdateVelocity(double pos, double dt) {
@@ -266,42 +277,44 @@ struct AxisState {
         timeHistory[posIdx] = dt > 0.0 ? dt : 0.001;
         posIdx = (posIdx + 1) % VEL_WINDOW;
 
-        // Windowed average — stable at low speed
         double oldPos = posHistory[posIdx];
         double elapsed = 0.0;
         for (int i = 0; i < VEL_WINDOW; i++) elapsed += timeHistory[i];
         double avgVel = (elapsed > 0.0001) ? (pos - oldPos) / elapsed : 0.0;
 
-        // 2-frame delta — responsive but not single-frame noisy
         int prev2 = (posIdx + VEL_WINDOW - 2) % VEL_WINDOW;
         double t2 = timeHistory[(posIdx + VEL_WINDOW - 1) % VEL_WINDOW]
             + timeHistory[(posIdx + VEL_WINDOW - 2) % VEL_WINDOW];
         double shortVel = (t2 > 0.0001) ? (pos - posHistory[prev2]) / t2 : 0.0;
 
-        // Only use shortVel if it's larger AND above noise floor
         if (fabs(shortVel) > SHORT_VEL_NOISE && fabs(shortVel) > fabs(avgVel))
             rawVel = shortVel;
         else
             rawVel = avgVel;
 
         double velSpeed = fabs(rawVel);
-        double alpha;
-        if (velSpeed < VEL_BLEND_LOW) {
-            alpha = VEL_ALPHA_LOW;                                      // heavy smoothing
+        double fc;
+        if (velSpeed < VEL_BLEND_VLOW) {
+            fc = 9.0;   // was 5 — cuts latency from ~32ms to ~18ms
+        }
+        else if (velSpeed < VEL_BLEND_LOW) {
+            double t = (velSpeed - VEL_BLEND_VLOW) / (VEL_BLEND_LOW - VEL_BLEND_VLOW);
+            t = t * t * (3.0 - 2.0 * t);
+            fc = 9.0 + (18.0 - 9.0) * t;    // was 3->8
         }
         else if (velSpeed < VEL_BLEND_HIGH) {
             double t = (velSpeed - VEL_BLEND_LOW) / (VEL_BLEND_HIGH - VEL_BLEND_LOW);
-            t = t * t * (3.0 - 2.0 * t);                               // smoothstep the blend too
-            alpha = VEL_ALPHA_LOW + (VEL_ALPHA_MID - VEL_ALPHA_LOW) * t;  // FIX: actually use t
+            t = t * t * (3.0 - 2.0 * t);
+            fc = 18.0 + (30.0 - 18.0) * t;  // was 8->15
         }
         else {
-            double bypassT = (velSpeed - VEL_BLEND_HIGH) / (HALF_RANGE_MAX - VEL_BLEND_HIGH);
-            bypassT = bypassT < 0.0 ? 0.0 : (bypassT > 1.0 ? 1.0 : bypassT);
-            alpha = VEL_ALPHA_MID + (VEL_ALPHA_HIGH - VEL_ALPHA_MID) * bypassT;  // FIX: blend up from mid
+            double t = (velSpeed - VEL_BLEND_HIGH) / (HALF_RANGE_MAX - VEL_BLEND_HIGH);
+            t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+            fc = 30.0 + (55.0 - 30.0) * t;  // was 15->30
         }
+        double alpha = 1.0 - exp(-2.0 * 3.14159265 * fc * dt);
         smoothVel += alpha * (rawVel - smoothVel);
 
-        // Restore zero-snap: without this, smoothVel drifts around a tiny nonzero value near rest
         if (fabs(rawVel) < VEL_DEADZONE && fabs(smoothVel) < VEL_DEADZONE * 2.0) {
             zeroCount++;
             if (zeroCount > 10) smoothVel = 0.0;
@@ -396,9 +409,14 @@ static void ApplyForces(double y, double z,
         double t = (r - FORCE_SPRING_START) / (FORCE_MAX_RAD - FORCE_SPRING_START);
         t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
         double mag = pow(t, FORCE_EXPONENT) * FORCE_MAX_N;
-        double vOut = velY * dirY + velZ * dirZ;
-        if (vOut > 0.0) mag += vOut * FORCE_DAMPING;
-        if (mag > 7.8) mag = 7.8;
+        double vOut = velY * dirY + velZ * dirZ; // velocity component outward
+        if (vOut > 0.0) {
+            // Scale damping up with proximity to PUSH_ENTER_RAD
+            double proximity = (r - FORCE_SPRING_START) / (PUSH_ENTER_RAD - FORCE_SPRING_START);
+            proximity = proximity < 0.0 ? 0.0 : (proximity > 1.0 ? 1.0 : proximity);
+            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 4.0); // up to 5x at edge
+            mag += vOut * dynamicDamp;
+        }
         forceY = -dirY * mag;
         forceZ = -dirZ * mag;
     }
@@ -494,6 +512,8 @@ int main() {
 
         axY.UpdateVelocity(y, dt);
         axZ.UpdateVelocity(z, dt);
+        axY.UpdateSlowRef(y, dt);
+        axZ.UpdateSlowRef(z, dt);
         axY.UpdateReach(y);
         axZ.UpdateReach(z);
 
@@ -541,7 +561,6 @@ int main() {
                 if (scaled > 1.0) scaled = 1.0;
                 return pow(scaled, crv);
             };
-
             auto curve = [&](double v) -> double {
                 if (fabs(v) < VEL_DEADZONE) return 0.0;
                 double sign = v > 0.0 ? 1.0 : -1.0;
@@ -572,6 +591,21 @@ int main() {
 
             stickX = curve(axY.smoothVel);
             stickY = curve(axZ.smoothVel);
+
+            // Position-error blend — kicks in when velocity signal is unreliable
+            double velMag = sqrt(axY.smoothVel * axY.smoothVel + axZ.smoothVel * axZ.smoothVel);
+            double posBlend = 1.0 - velMag / posBlendMax;
+            posBlend = posBlend < 0.0 ? 0.0 : (posBlend > 1.0 ? 1.0 : posBlend);
+            posBlend = posBlend * posBlend * (3.0 - 2.0 * posBlend);
+
+            if (posBlend > 0.0) {
+                double pcX = axY.PosError(y) * VEL_VLOW_POS_SCALE;
+                double pcY = axZ.PosError(z) * VEL_VLOW_POS_SCALE;
+                pcX = pcX < -1.0 ? -1.0 : (pcX > 1.0 ? 1.0 : pcX);
+                pcY = pcY < -1.0 ? -1.0 : (pcY > 1.0 ? 1.0 : pcY);
+                stickX = stickX * (1.0 - posBlend) + pcX * posBlend;
+                stickY = stickY * (1.0 - posBlend) + pcY * posBlend;
+            }
         }
 
         rumblePhase += dt * 80.0 * 2.0 * 3.14159265;

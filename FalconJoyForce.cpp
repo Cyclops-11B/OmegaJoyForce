@@ -64,7 +64,7 @@ static const double GRAVITY_COMP_SCALE = 2.3;  // 1.0 = normal, 1.2 = 20% more, 
 static const double AMBIENT_LARGE_SCALE = 5.5;  // random rumble force scale
 static const double AMBIENT_SMALL_SCALE = 5.5;  // random rumble force scale
 static const double RUMBLE_DECAY = 0.60;
-static const double RUMBLE_FORCE_SCALE = 30.0; // overall scale factor of rumble force
+static const double RUMBLE_FORCE_SCALE = 40.0; // overall scale factor of rumble force
 
 // ──Recoil settings ──────────────────────────────────────────────────────
 static const double RUMBLE_LARGE_SCALE = 2.4;  // recoil force scale
@@ -417,14 +417,14 @@ static void ApplyForces(double y, double z,
             proximity = proximity < 0.0 ? 0.0 : (proximity > 1.0 ? 1.0 : proximity);
 
             // Gate: only apply enhanced damping above a velocity threshold
-            static const double DAMP_VEL_MIN = 0.004; // below this = no enhanced damping
+            static const double DAMP_VEL_MIN = 0.010; // below this = no enhanced damping
             static const double DAMP_VEL_MAX = 0.020; // above this = full enhanced damping
             double velMag = sqrt(velY * velY + velZ * velZ);
             double velGate = (velMag - DAMP_VEL_MIN) / (DAMP_VEL_MAX - DAMP_VEL_MIN);
             velGate = velGate < 0.0 ? 0.0 : (velGate > 1.0 ? 1.0 : velGate);
             velGate = velGate * velGate * (3.0 - 2.0 * velGate); // smoothstep
 
-            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 4.0 * velGate);
+            double dynamicDamp = FORCE_DAMPING * (1.0 + proximity * 2.0 * velGate);
             mag += vOut * dynamicDamp;
         }
         forceY = -dirY * mag;

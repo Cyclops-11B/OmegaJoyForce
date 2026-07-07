@@ -24,7 +24,7 @@
     <ProjectGuid>{375b3789-69bd-4146-8f94-e384cfbd9f41}</ProjectGuid>
     <RootNamespace>FalconToJoystick</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>FalconJoyForce</ProjectName>
+    <ProjectName>OmegaJoyForce</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -146,13 +146,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="FalconJoyForce.cpp" />
+    <ClCompile Include="OmegaJoyForce.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource2.h" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="FalconJoyForce.rc" />
+    <ResourceCompile Include="OmegaJoyForce.rc" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="..\..\..\Downloads\Falc1.ico" />

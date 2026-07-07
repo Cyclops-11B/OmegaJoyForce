@@ -26,7 +26,7 @@ static const BYTE PACKET_IN_MAGIC = 0xAA;
 static const BYTE PACKET_OUT_MAGIC = 0xBB;
 
 // ── Controller config ──────────────────────────────────────────────────────
-static const int  UPDATE_RATE_MS = .25;
+// UPDATE_RATE_MS removed: the loop is throttled by blocking DHD USB transactions (~1 kHz).
 static const bool INVERT_X = false;
 static const bool INVERT_Y = false;
 
@@ -167,7 +167,7 @@ static const double FRICTION_VEL_MAX = 0.02;
 
 static const double FORCE_SPRING_START = 0.3;
 static const double FORCE_MAX_RAD = 0.88;
-static const double FORCE_MAX_N = 3.0;
+static const double FORCE_MAX_N = 6.0;
 static const double FORCE_DAMPING = 3.0;
 static const double FORCE_EXPONENT = 2.3;
 
@@ -199,7 +199,7 @@ static const double PUSH_BACK_N = 1.0;   // back (+X) direction weight
 static const double PUSH_UP_N = 0.5;   // up direction weight (relative to back)
 static const double PUSH_UP_AXIS_IS_Z = 1.0;   // 1.0 = "up" is +Z (forceZ); 0.0 = +Y
 static const double PUSH_DECAY_HZ = 9.5;   // accumulator decay [1/s] — discrete<->sustained crossover
-static const double PUSH_MAX_N = 2.0;   // clamp on accumulated push magnitude [N]
+static const double PUSH_MAX_N = 8.0;   // clamp on accumulated push magnitude [N]
 static const double PUSH_MIN_N = 0.05;  // below this the push is considered finished
 
 // ── Recoil aim compensation ────────────────────────────────────────────────
@@ -215,7 +215,7 @@ static const double RECOIL_COMP_HOLD_MS = 90;    // keep compensating this long 
 // ── Ambient rumble (no trigger) ────────────────────────────────────────────
 // Random-direction Y/Z buzz whose magnitude scales with the live signal.
 // Direction re-randomizes every AMBIENT_DIR_MS for a textured feel.
-static const double AMBIENT_SCALE_N = 3.0;   // ambient force at full drive [N]
+static const double AMBIENT_SCALE_N = 6.0;   // ambient force at full drive [N]
 static const DWORD  AMBIENT_DIR_MS = 40;    // ms between new random direction targets
 static const double AMBIENT_MIN_DRIVE = 0.02;  // below this drive, ambient is silent
 static const double AMBIENT_SMOOTH_HZ = 7.0;   // magnitude attack/release low-pass [Hz] — lower = softer, more "push"
@@ -270,6 +270,7 @@ static double          g_recoilDirZ = 1.0;
 static double          g_recoilCompEnv = 0.0;    // 0..1 compensation strength envelope
 static DWORD           g_recoilCompHold = 0;      // tick until which to keep compensating
 static volatile bool   g_running = true;
+static volatile bool   g_debugMode = false;   // shared with serial thread (gates console I/O)
 static volatile uint8_t g_btnMask = 0;
 static volatile uint8_t g_dhdButtons = 0;
 
@@ -349,7 +350,7 @@ static DWORD WINAPI SerialReaderThread(LPVOID) {
                 g_rumbleLargePeak = inL;
                 g_rumbleSmallPeak = inS;
                 static DWORD lastRawPrint = 0;
-                if (GetTickCount() - lastRawPrint > 100) {
+                if (g_debugMode && GetTickCount() - lastRawPrint > 100) {
                     lastRawPrint = GetTickCount();
                     printf("\nRAW: L=%.3f S=%.3f\n", inL, inS);
                 }
@@ -708,10 +709,8 @@ int main() {
     axZ.LockCenter(0.0);
     printf("Center locked to device origin (0,0,0).\n");
 
-    DWORD  lastFrame = GetTickCount();
     DWORD  lastStats = GetTickCount();
     int    hz = 0;
-    bool   debugMode = false;
     bool   btn1WasHeld = false;
     g_btn1Released = GetTickCount();
 
@@ -720,15 +719,31 @@ int main() {
     bool   wasRecoilActive = false;
     double stickScale = 1.0;
 
+    // High-resolution timing for dt. GetTickCount has 1 ms resolution, which at
+    // a ~1 kHz loop makes dt read 0 or 1 ms at random — every IIR filter alpha
+    // in the pipeline is computed from dt, so they'd all be fed quantization
+    // noise. QueryPerformanceCounter gives sub-microsecond dt. GetTickCount is
+    // still used for coarse ms timestamps (button windows, dwell timers).
+    LARGE_INTEGER qpcFreq, qpcLast;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcLast);
+    DWORD lastKeyCheck = 0;   // gate GetAsyncKeyState polling to every 50 ms
+
     while (true) {
-        DWORD  now = GetTickCount();
-        double dt = (now - lastFrame) / 1000.0;
-        if (dt > 0.05) dt = 0.01;
-        lastFrame = now;
+        DWORD  now = GetTickCount();     // coarse ms timestamps only
+        LARGE_INTEGER qpcNow;
+        QueryPerformanceCounter(&qpcNow);
+        double dt = (double)(qpcNow.QuadPart - qpcLast.QuadPart) / (double)qpcFreq.QuadPart;
+        qpcLast = qpcNow;
+        if (dt > 0.05)   dt = 0.01;      // clamp hiccups (debugger pause, etc.)
+        if (dt < 1e-6)   dt = 1e-6;
 
         // ── Read position ──────────────────────────────────────────────────
         double x, y, z;
-        if (dhdGetPosition(&x, &y, &z) < 0) {
+        double oaRaw = 0.0, obRaw = 0.0, ogRaw = 0.0;
+        // One combined USB transaction for position AND wrist orientation
+        // instead of two separate round-trips per loop.
+        if (dhdGetPositionAndOrientationRad(&x, &y, &z, &oaRaw, &obRaw, &ogRaw) < 0) {
             printf("Lost Omega.7: %s\n", dhdErrorGetLastStr());
             break;
         }
@@ -902,9 +917,10 @@ int main() {
         if (springSigned >= 0.0) { if (gripForce < 0.0) gripForce = 0.0; }
         else { if (gripForce > 0.0) gripForce = 0.0; }
 
-        // Diagnostic: print gripper state every second. Remove once tuned.
+        // Diagnostic: print gripper state every second (debug mode only —
+        // console I/O can block for milliseconds and stall the haptic loop).
         static DWORD lastGripPrint = 0;
-        if (now - lastGripPrint >= 1000) {
+        if (g_debugMode && now - lastGripPrint >= 1000) {
             lastGripPrint = now;
             printf("\nGRIP gap=%.4fm  op=%.0f%%%s  far=%.0f%%%s%s  grip=%+.2f\n",
                 gripperGap,
@@ -954,8 +970,10 @@ int main() {
         if (g_btn3Active)   btnMask |= (1u << 2);  // button 3
         if (g_btn4Latched)  btnMask |= (1u << 3);  // button 4
 
-        if (dhdGetButton(0) > 0) btnMask |= (1u << 4);  // physical btn 0
-        if (dhdGetButton(1) > 0) btnMask |= (1u << 5);  // physical btn 1
+        // One call for all physical buttons instead of two round-trips.
+        uint32_t physBtns = (uint32_t)dhdGetButtonMask();
+        if (physBtns & 0x1) btnMask |= (1u << 4);  // physical btn 0
+        if (physBtns & 0x2) btnMask |= (1u << 5);  // physical btn 1
 
         // ── Recoil active window driven by bit 0 (full trigger / btn1) ────
         bool btn1held = (btnMask & (1u << 0)) != 0;
@@ -1174,9 +1192,10 @@ int main() {
         // you hold still. No neutral needed — a static tilt produces zero rate.
         double wristYawRate = 0.0, wristPitchRate = 0.0;
         if (WRIST_FINE_ENABLE) {
-            double oa = 0.0, ob = 0.0, og = 0.0;
-            if (dhdGetOrientationRad(&oa, &ob, &og) >= 0) {
-                double ang[3] = { oa, ob, og };
+            // Orientation already fetched in the combined position read above —
+            // no second USB transaction needed.
+            {
+                double ang[3] = { oaRaw, obRaw, ogRaw };
                 double yawRaw = ang[WRIST_YAW_IDX];
                 double pitchRaw = ang[WRIST_PITCH_IDX];
 
@@ -1238,7 +1257,13 @@ int main() {
             }
         }
 
-        // ── Send controller packet ─────────────────────────────────────────
+        // ── Send controller packet (rate-limited to the wire) ──────────────
+        // A 7-byte packet is 70 bits ≈ 0.61 ms at 115200 baud, but the loop runs
+        // ~1 kHz+. Writing every iteration outruns the UART, so the OS transmit
+        // buffer backs up and stick data arrives progressively LATER — a real
+        // latency leak. Send every SERIAL_SEND_MS instead (still ~2x faster than
+        // the wire needs), but flush IMMEDIATELY on any button change so button
+        // latency stays one loop-tick.
         double stickScale = 1.0 - g_pushDamp;
         if (stickScale < 0.0) stickScale = 0.0;
         if (recoilActive)
@@ -1246,7 +1271,16 @@ int main() {
 
         int16_t lx = ToStick(stickX * stickScale * (INVERT_X ? -1.0 : 1.0));
         int16_t ly = ToStick(stickY * stickScale * (INVERT_Y ? -1.0 : 1.0));
-        SendControllerPacket(lx, ly, btnMask);
+        {
+            static const DWORD SERIAL_SEND_MS = 2;   // ~500 Hz output rate
+            static DWORD   lastSend = 0;
+            static uint8_t lastBtnMask = 0xFF;
+            if (btnMask != lastBtnMask || now - lastSend >= SERIAL_SEND_MS) {
+                SendControllerPacket(lx, ly, btnMask);
+                lastSend = now;
+                lastBtnMask = btnMask;
+            }
+        }
 
         // ── Status display ─────────────────────────────────────────────────
         hz++;
@@ -1254,7 +1288,7 @@ int main() {
             double sigNow = (g_rumbleLargePeak * RUMBLE_LARGE_SCALE
                 + g_rumbleSmallPeak * RUMBLE_SMALL_SCALE);
             double r = sqrt(offY * offY + offZ * offZ);
-            if (debugMode) {
+            if (g_debugMode) {
                 printf("\nY: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
                     axY.estCenter, axY.halfRange, offY, axY.smoothVel);
                 printf("Z: ctr=%+.4f half=%.4f off=%+.2f vel=%+.4f\n",
@@ -1267,12 +1301,8 @@ int main() {
                 printf("r=%.3f  push=%s  damp=%.2f  stk=(%.2f,%.2f)  pushN=%.2f  sig=%.2f %s\n",
                     r, inPush ? "YES" : "no", g_pushDamp, stickX, stickY,
                     g_pushForce, sigNow, recoilActive ? "PUSH" : "ambient");
-                {
-                    double oa = 0, ob = 0, og = 0;
-                    dhdGetOrientationRad(&oa, &ob, &og);
-                    printf("WRIST raw: oa=%+.3f ob=%+.3f og=%+.3f  (yaw=idx%d pitch=idx%d)  rate: yaw=%+.3f pitch=%+.3f rad/s\n",
-                        oa, ob, og, WRIST_YAW_IDX, WRIST_PITCH_IDX, wristYawRate, wristPitchRate);
-                }
+                printf("WRIST raw: oa=%+.3f ob=%+.3f og=%+.3f  (yaw=idx%d pitch=idx%d)  rate: yaw=%+.3f pitch=%+.3f rad/s\n",
+                    oaRaw, obRaw, ogRaw, WRIST_YAW_IDX, WRIST_PITCH_IDX, wristYawRate, wristPitchRate);
             }
             else {
                 int col = (int)((offY + 1.0) / 2.0 * 8.0 + 0.5);
@@ -1289,55 +1319,60 @@ int main() {
             hz = 0; lastStats = now;
         }
 
-        if (GetAsyncKeyState(VK_F9) & 0x8000) break;
-        if (GetAsyncKeyState(VK_F10) & 0x8000) {
-            debugMode = !debugMode;
-            printf("\nDebug %s\n", debugMode ? "ON" : "OFF");
-            Sleep(200);
-        }
-        if (GetAsyncKeyState(VK_F11) & 0x8000) {
-            printf("\nRecalibrating (no prompts): re-reading SDK gripper range, re-locking center...\n");
-            axY = {}; axZ = {};
-            axY.LockCenter(0.0);   // center = device origin after homing
-            axZ.LockCenter(0.0);
+        // ── Keyboard (gated to every 50 ms — 4 syscalls/iter at 1 kHz is waste)
+        if (now - lastKeyCheck >= 50) {
+            lastKeyCheck = now;
+            if (GetAsyncKeyState(VK_F9) & 0x8000) break;
+            if (GetAsyncKeyState(VK_F10) & 0x8000) {
+                g_debugMode = !g_debugMode;
+                printf("\nDebug %s\n", g_debugMode ? "ON" : "OFF");
+                Sleep(200);
+            }
+            if (GetAsyncKeyState(VK_F11) & 0x8000) {
+                printf("\nRecalibrating (no prompts): re-reading SDK gripper range, re-locking center...\n");
+                axY = {}; axZ = {};
+                axY.LockCenter(0.0);   // center = device origin after homing
+                axZ.LockCenter(0.0);
 
-            // Re-read gripper joint angle range from the SDK and convert to gap.
-            dhdEnableExpertMode();
-            double jmin[DHD_MAX_DOF] = {}, jmax[DHD_MAX_DOF] = {};
-            double aClosed = 0.0, aOpen = GRIPPER_MAX_RAD_FB;
-            if (dhdGetJointAngleRange(jmin, jmax) >= 0) {
-                double a0 = jmin[6], a1 = jmax[6];
-                aClosed = fabs(a0) < fabs(a1) ? a0 : a1;
-                aOpen = fabs(a0) < fabs(a1) ? a1 : a0;
+                // Re-read gripper joint angle range from the SDK and convert to gap.
+                dhdEnableExpertMode();
+                double jmin[DHD_MAX_DOF] = {}, jmax[DHD_MAX_DOF] = {};
+                double aClosed = 0.0, aOpen = GRIPPER_MAX_RAD_FB;
+                if (dhdGetJointAngleRange(jmin, jmax) >= 0) {
+                    double a0 = jmin[6], a1 = jmax[6];
+                    aClosed = fabs(a0) < fabs(a1) ? a0 : a1;
+                    aOpen = fabs(a0) < fabs(a1) ? a1 : a0;
+                }
+                double gNow = 0.0, aNow = 0.0, k = GRIPPER_GAP_PER_RAD;
+                if (dhdGetGripperGap(&gNow) >= 0 && dhdGetGripperAngleRad(&aNow) >= 0
+                    && fabs(aNow) > 0.05 && gNow > 0.0) {
+                    k = gNow / aNow;
+                }
+                dhdDisableExpertMode();
+                g_gripMinGap = fabs(k * aClosed);
+                g_gripMaxGap = fabs(k * aOpen);
+                if (g_gripMaxGap <= g_gripMinGap) g_gripMaxGap = g_gripMinGap + 0.030;
+                g_gripRestGap = g_gripMinGap + (g_gripMaxGap - g_gripMinGap) * REST_FRAC;
+                g_opTravel = g_gripRestGap - g_gripMinGap;
+                g_farTravel = g_gripMaxGap - g_gripRestGap;
+                if (g_opTravel < 0.005) g_opTravel = 0.005;
+                if (g_farTravel < 0.005) g_farTravel = 0.005;
+                g_btn1Latched = false; g_btn4Latched = false; g_btn3Active = false;
+                g_farWallEnter = 0;
+                g_breakImpulse = 0.0; g_halfImpulse = 0.0; g_farBreakImpulse = 0.0;
+                g_wristSeeded = false;   // re-seed wrist rate tracking
+                g_wristRateAccum = 0.0; g_wristYawRateS = 0.0; g_wristPitchRateS = 0.0;
+                printf("Center=origin  closed=%.4fm open=%.4fm rest(mid)=%.4fm\n",
+                    g_gripMinGap, g_gripMaxGap, g_gripRestGap);
+                Sleep(200);
             }
-            double gNow = 0.0, aNow = 0.0, k = GRIPPER_GAP_PER_RAD;
-            if (dhdGetGripperGap(&gNow) >= 0 && dhdGetGripperAngleRad(&aNow) >= 0
-                && fabs(aNow) > 0.05 && gNow > 0.0) {
-                k = gNow / aNow;
-            }
-            dhdDisableExpertMode();
-            g_gripMinGap = fabs(k * aClosed);
-            g_gripMaxGap = fabs(k * aOpen);
-            if (g_gripMaxGap <= g_gripMinGap) g_gripMaxGap = g_gripMinGap + 0.030;
-            g_gripRestGap = g_gripMinGap + (g_gripMaxGap - g_gripMinGap) * REST_FRAC;
-            g_opTravel = g_gripRestGap - g_gripMinGap;
-            g_farTravel = g_gripMaxGap - g_gripRestGap;
-            if (g_opTravel < 0.005) g_opTravel = 0.005;
-            if (g_farTravel < 0.005) g_farTravel = 0.005;
-            g_btn1Latched = false; g_btn4Latched = false; g_btn3Active = false;
-            g_farWallEnter = 0;
-            g_breakImpulse = 0.0; g_halfImpulse = 0.0; g_farBreakImpulse = 0.0;
-            g_wristSeeded = false;   // re-seed wrist rate tracking
-            g_wristRateAccum = 0.0; g_wristYawRateS = 0.0; g_wristPitchRateS = 0.0;
-            printf("Center=origin  closed=%.4fm open=%.4fm rest(mid)=%.4fm\n",
-                g_gripMinGap, g_gripMaxGap, g_gripRestGap);
-            Sleep(200);
-        }
-        // ── F12: gripper force sign test ───────────────────────────────────
+        }  // end keyboard gate (F9–F11 are toggles; 50 ms polling is plenty)
+
+        // ── F12: gripper force sign test (checked EVERY loop) ──────────────
+        // F12 is hold-to-apply: it must win over the normal force path on every
+        // iteration while held, so it cannot live inside the 50 ms gate.
         // Hold F12 to apply +3N. With the corrected convention this should
         // push the gripper OPEN (resist your fingers closing it).
-        // If it instead snaps shut, the hardware sign is still inverted —
-        // flip the sign of all the TRIG_*_N force constants and both impulses.
         if (GetAsyncKeyState(VK_F12) & 0x8000) {
             static DWORD lastSignTest = 0;
             if (now - lastSignTest > 200) {
@@ -1347,7 +1382,11 @@ int main() {
             dhdSetForceAndTorqueAndGripperForce(0, 0, 0, 0, 0, 0, +3.0);
             continue;
         }
-        Sleep(UPDATE_RATE_MS);
+
+        // No Sleep() here. UPDATE_RATE_MS was effectively Sleep(0), which yields
+        // the timeslice and can hand the CPU away mid-loop. The blocking DHD USB
+        // transactions naturally throttle this loop to the device rate (~1 kHz),
+        // so a tight loop is both lower-latency and not a busy-spin.
     }
 
     dhdSetForceAndTorqueAndGripperForce(0, 0, 0, 0, 0, 0, 0);
